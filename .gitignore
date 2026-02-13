@@ -1,2 +1,5 @@
-working.txt
-examples/
+*
+!*/
+!*.h
+!*.cpp
+!CMakeLists.txt
