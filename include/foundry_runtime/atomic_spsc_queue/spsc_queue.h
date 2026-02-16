@@ -25,11 +25,13 @@ static inline void sw_prefetch_write(const void* p) noexcept {
 }
 
 
-template <class T, size_t capacity, bool enable_cacheline_padding, bool enable_prefetch>
+// if prefetch_distance == 0, we don't prefetch
+template <class T, size_t capacity = 128, bool enable_cacheline_padding = false, size_t prefetch_distance = 0>
 class spsc_queue {
     static_assert(capacity >= 2);
     static_assert(std::is_trivially_copyable_v<T>, "Trivially Copyable T NOT Provided...");    
     static_assert((capacity & (capacity - 1)) == 0, "capacity must be power of two...");
+    static_assert((prefetch_distance < (capacity / 2)));
 
     static constexpr std::size_t capacity_mask = capacity - 1;
 
@@ -73,11 +75,14 @@ public:
         auto next_loc          = increment(current_write_loc);
 
         if (next_loc == cached_read_loc) {
-            cached_read_loc = read_next.r_w_index.load(std::memory_order_acquire);
+            cached_read_loc = read_next.r_w_index.load(std::memory_order_acquire/* std::memory_order_relaxed*/);
             if (next_loc == cached_read_loc) return false;
         }
 
-        if constexpr (enable_prefetch) sw_prefetch_write(&queue[current_write_loc]);
+        if constexpr (prefetch_distance > 0) {
+            const auto current_index = (current_write_loc + prefetch_distance) & capacity_mask;
+            sw_prefetch_write(&queue[current_index]);
+        }
         queue[current_write_loc] = in_data;
 
         write_next.r_w_index.store(next_loc, std::memory_order_release);
@@ -93,10 +98,13 @@ public:
             if (current_read_loc == cached_write_loc) return false;
         }
 
-        if constexpr (enable_prefetch) sw_prefetch_read(&queue[current_read_loc]);
+        if constexpr (prefetch_distance > 0) {
+            const auto prefetch_index = (current_read_loc + prefetch_distance) & capacity_mask;
+            sw_prefetch_read(&queue[prefetch_index]);
+        }
         out_data = queue[current_read_loc];
 
-        read_next.r_w_index.store(increment(current_read_loc), std::memory_order_release);
+        read_next.r_w_index.store(increment(current_read_loc), std::memory_order_release /*std::memory_order_relaxed*/);
         
         return true;
     }

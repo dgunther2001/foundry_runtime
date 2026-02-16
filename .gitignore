@@ -3,3 +3,5 @@
 !*.h
 !*.cpp
 !CMakeLists.txt
+!README.md
+!examples/spsc_queue/figures
