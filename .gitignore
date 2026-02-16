@@ -4,4 +4,4 @@
 !*.cpp
 !CMakeLists.txt
 !README.md
-!examples/spsc_queue/figures
+!examples/spsc_queue/figures/spsc_data.png
