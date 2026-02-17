@@ -5,3 +5,4 @@
 !CMakeLists.txt
 !README.md
 !examples/spsc_queue/figures/spsc_data.png
+!examples/spsc_queue/figures/prefetch_experiment.png

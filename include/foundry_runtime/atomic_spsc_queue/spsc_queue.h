@@ -31,7 +31,7 @@ class spsc_queue {
     static_assert(capacity >= 2);
     static_assert(std::is_trivially_copyable_v<T>, "Trivially Copyable T NOT Provided...");    
     static_assert((capacity & (capacity - 1)) == 0, "capacity must be power of two...");
-    static_assert((prefetch_distance < (capacity / 2)));
+    static_assert((prefetch_distance < (capacity - 2)));
 
     static constexpr std::size_t capacity_mask = capacity - 1;
 
@@ -97,7 +97,6 @@ public:
             cached_write_loc = write_next.r_w_index.load(std::memory_order_acquire);
             if (current_read_loc == cached_write_loc) return false;
         }
-
         if constexpr (prefetch_distance > 0) {
             const auto prefetch_index = (current_read_loc + prefetch_distance) & capacity_mask;
             sw_prefetch_read(&queue[prefetch_index]);

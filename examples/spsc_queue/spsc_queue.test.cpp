@@ -37,6 +37,19 @@ static inline void set_affinity_tag(int tag) {
 
 #endif
 
+
+static inline void cpu_wait() noexcept {
+#if defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#elif defined(__x86_64__)
+    _mm_pause();
+#else 
+    __asm__ __volatile__("" ::: "memory");
+#endif
+}
+
+
+
 static inline void setup_benchmark_thread() {
 #if defined(__APPLE__)
     set_qos_high(true);
@@ -58,7 +71,7 @@ ThreadPair dispatchThreads(QueueType& queue, std::uint64_t number) {
 
             for (uint64_t i = number; i > 0; --i) {
                 while (!queue.try_enqueue(i)) {
-                    std::this_thread::yield();
+                    std::this_thread::yield(); 
                 }
             }
         })
@@ -78,7 +91,7 @@ ThreadPair dispatchThreads(QueueType& queue, std::uint64_t number) {
                     }                    
                     decrementor--;
                 }
-                else std::this_thread::yield();
+                else std::this_thread::yield(); 
             }
         })        
     };
@@ -117,21 +130,23 @@ void vary_parameters_per_capacity(std::uint64_t number, uint8_t num_sims) {
         constexpr bool cache_padding   = decltype(ena_cache_padding)::value;
         constexpr std::size_t prefetch = decltype(ena_prefetch)::value;
 
-        double time_sum = 0;
-        double minimum  = std::numeric_limits<double>::max();
-        double maximum  = 0;
-        double current_sim_length = 0;
+        if constexpr (prefetch < (capacity - 2)) {
+            double time_sum = 0;
+            double minimum  = std::numeric_limits<double>::max();
+            double maximum  = 0;
+            double current_sim_length = 0;
 
-        for (uint8_t sim_num = 0; sim_num < num_sims; sim_num++) {
-            current_sim_length = run_single_sim<capacity, cache_padding, prefetch>(number);
-            time_sum += current_sim_length;
+            for (uint8_t sim_num = 0; sim_num < num_sims; sim_num++) {
+                current_sim_length = run_single_sim<capacity, cache_padding, prefetch>(number);
+                time_sum += current_sim_length;
 
-            if (current_sim_length < minimum) minimum = current_sim_length;
-            if (current_sim_length > maximum) maximum = current_sim_length;
+                if (current_sim_length < minimum) minimum = current_sim_length;
+                if (current_sim_length > maximum) maximum = current_sim_length;
+            }
+
+            double avg_sim_time = time_sum / num_sims;
+            std::cout << "lock-free,uint64_t," << int(num_sims) << "," << capacity << "," << cache_padding << "," << prefetch << "," << avg_sim_time << "," << maximum << "," << minimum << "," << number << "\n";
         }
-
-        double avg_sim_time = time_sum / num_sims;
-        std::cout << "lock-free,uint64_t," << int(num_sims) << "," << capacity << "," << cache_padding << "," << prefetch << "," << avg_sim_time << "," << maximum << "," << minimum << "," << number << "\n";
     };
 
     using prefetchOff = std::integral_constant<std::size_t, 0>;
@@ -140,12 +155,16 @@ void vary_parameters_per_capacity(std::uint64_t number, uint8_t num_sims) {
     using prefetchFour = std::integral_constant<std::size_t, 4>;
     using prefetchEight= std::integral_constant<std::size_t, 8>;
     using prefetchSixteen= std::integral_constant<std::size_t, 16>;
+    using prefetchThirtyTwo= std::integral_constant<std::size_t, 32>;
+    using prefetchSixtyFour= std::integral_constant<std::size_t, 64>;
 
     // note that prefetch is a uint8_t now.....
     run_sims(std::bool_constant<false>{}, prefetchOff{});
     run_sims(std::bool_constant<false>{}, prefetchOne{});
     //run_sims(std::bool_constant<false>{}, prefetchTwo{});
     run_sims(std::bool_constant<false>{}, prefetchFour{});
+    run_sims(std::bool_constant<false>{}, prefetchThirtyTwo{});
+    //run_sims(std::bool_constant<false>{}, prefetchSixtyFour{});
     //run_sims(std::bool_constant<false>{}, prefetchEight{});
     //run_sims(std::bool_constant<false>{}, prefetchSixteen{});
 
@@ -155,6 +174,8 @@ void vary_parameters_per_capacity(std::uint64_t number, uint8_t num_sims) {
     run_sims(std::bool_constant<true>{},  prefetchFour{});
     //run_sims(std::bool_constant<true>{},  prefetchEight{});
     //run_sims(std::bool_constant<true>{},  prefetchSixteen{});
+    run_sims(std::bool_constant<true>{}, prefetchThirtyTwo{});
+    //run_sims(std::bool_constant<true>{}, prefetchSixtyFour{});
 }
 
 template <std::size_t... capacities>
@@ -191,7 +212,7 @@ int main() {
     constexpr uint8_t  num_sims = 10;
 
     std::cout << "queue_type,type,numsims,capacity,cache_padding,prefetch,avg_sim_time,max_sim_time,min_sim_time,num_enq_deq\n";
-    run_many_capacities<64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144/*, 524288, 1048576, 2097152, 4194304*/>(number, num_sims);
+    run_many_capacities<4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144/*, 524288, 1048576, 2097152, 4194304*/>(number, num_sims);
     run_mutex_queue(number, num_sims);
 
     return 0;
