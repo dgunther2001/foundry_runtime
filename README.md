@@ -1,5 +1,5 @@
 # Foundry Runtime
-This is a collection of various runtime tools as well as a personal exploration/proving ground. I will add descriptions to this doc as the tools are written and provide APIs/a usage guide.  
+Foundry Runtime is a collection of runtime tools and performance experiments focused on microarchitectural behavior and thread synchronization across multiple layers of abstraction.  
 
 ## SPSC Lock-Free Queue
 This is a single-producer, single-consumer lock-free queue implementation. It currently only works for trivially copyable types (proof of concept), but I am currently working on making it valid for all types. The API is quite simple and is intended to be used by two separate threads (consumer and producer).  
@@ -24,7 +24,7 @@ Although I definitely have some utility for this, I used this as an exercise to 
 The results are quite interesting and illustrate some interesting microarchitectural performance regimes. I will lay out some of my observations and interpretations below. 
 1. **Queue vs Non-Optimized Atomic Implementation**    
 a. **Lock-Free Throughput Maxima**   
-    The lock-free queue of `uint64_t` without prefetch and r/w index padding outperforms a standard mutex queue between ~16-512 entries (128 B to 4 KB). In this range, the entire ring buffer fits easily within each core's 128 KB L1d and is thus not bound by capacity and L2/L3 latency. The mutex implementation costly lock/unlock operations, as well as additional branching to serialize execution independent of cacheline contention. The lock-free implementation instead uses atomic r/w index updates. Despite significant traffic between cores, the lock-free queue achieves ~2x throughput in this range (really just ~32-256).  
+    The lock-free queue of `uint64_t` without prefetch and r/w index padding outperforms a standard mutex queue between ~16-512 entries (128 B to 4 KB). In this range, the entire ring buffer fits easily within each core's 128 KB L1d and is thus not bound by capacity and L2/L3 latency. The mutex implementation uses costly lock/unlock operations, as well as additional branching to serialize execution independent of cacheline contention. The lock-free implementation instead uses atomic r/w index updates. Despite significant traffic between cores, the lock-free queue achieves ~2x throughput in this range (really just ~32-256).  
     At small sizes (~4-16 entries), the producer and consumer repeatedly operate on the same cachelines in tight sequence. Each enqueue requires exclusive line ownership with subsequent reads from the consumer. The lines are invalidated and ownership is transferred between cores so frequently that the queue stalls, throttling throughput.  
     For larger queue sizes (>~512 entries), although they are all relatively small/fit entirely in the L1d, the reuse distance increases. As a result these lines are less likely to remain hot in the producer's L1d. Without software prefetch, enqueue operations (queue writes) see read for ownership (RFO) latency begin to dominate causing the throughput to collapse as the queue becomes bound by L2/L3 latency (RFOs resolved higher up in the hierarchy). At higher buffer sizes, throughput collapses and ownership latency exceeds mutex latency.  
     The lock-free queue transitions from coherence-limited, to RFO latency limited as ring size increases, finding a local maximum between ~16-512 entries, while the mutex based queue is synchronization limited independent of size.   
@@ -45,9 +45,43 @@ b. **Worst Case Synchronization Mechanics Between Queue Implementations**
     // lowers to
     stlr   x?, [x?]    
     ```
-    Each strongly ordered atomic load and store to the read and write indices, we set up a very low cost acquire/release instruction pair. Worst case, synchronization is all EL0 with no `dmb` or `dsb` instructions, and no transitions to the kernel (EL1) with some minor branching overhead. 
+    Each strongly ordered atomic load and store to the read and write indices, we set up a very low cost acquire/release instruction pair. Worst case, synchronization is all EL0 with no `dmb` or `dsb` instructions, and no transitions to the kernel (EL1) with some minor branching overhead.  
+    `try_enqueue(T&...)` for the mutex based worst case has a considerably higher worst case cost. Although uncontended locks tend to stay in user space, under contention the implementation may take a slow path that results in multiple kernel entries.
+    ```
+    std::unique_lock<std::mutex> lock(mut);
+    // contentious case translates into a combination of the following calls
 
-**NEED TO FINISH SYNCHRONIZATION ANALYSIS**. 
+    __ulock_wait 
+    // lowers to 
+    mov    x16, #0x203 ; =515 // syscall 515
+    svc    #0x80              // EL0 -> EL1 (kernel)
+
+    __ulock_wake
+    mov    x16, #0x204 ; =516 // syscall 516
+    svc    #0x80              // EL0 -> EL1 (kernel)
+    ```
+    In the contentious case, the control flow for a single queue write can look like:  
+    ```
+    Thread A (EL0)
+    -> try_enqueue(T&...)
+    -> fails to acquire the mutex
+    -> __ulock_wait
+    -> EL0 -> EL1 (Thread A "goes to sleep")
+
+    Thread B (EL0)
+    -> releases the mutex
+    -> __ulock_wake
+    -> EL0 -> EL1 ("wakes up" Thread A)
+
+    Thread A 
+    -> resumes execution in EL0
+    -> writes to the queue
+    ```
+    A single write to the queue can involve multiple transitions to the kernel, wheras the lock-free implementation always remains entirely in EL0 relying only on acquire/release instructions and cache coherency.  
+
+    Kernel transitions can be extremely expensive, but that alone doesn't guarantee better performance. For very small and larger buffer sizes, the unoptimized lock-free implementation performs worse than the mutex-based queue despite avoiding syscalls. This indicates that microarchitecture, not just kernel transitions, drastically affects performance. To address this, I used additional techniques to improve baseline throughput and stabilize across buffer sizes. I outline these below.  
+    
+
 **MORE TO COME/WIP**
 
   
