@@ -1,7 +1,20 @@
 # Foundry Runtime
 Foundry Runtime is a collection of runtime tools and performance experiments focused on microarchitectural behavior and thread synchronization across multiple layers of abstraction.  
 
+## Table of Contents
+* [SPSC Lock-Free Queue](#spsc-lock-free-queue)
+    * [API](#spsc-api)
+    * [Performance Experiments](#spsc-queue-performance-experiments)
+        * [0. Context](#spsc-experiment-context)
+        * [1. Mutex Queue vs Non-Optimized Atomic Implementation](#1-mutex-queue-vs-non-optimized-atomic-implementation)
+        * [2. Atomic Index Cacheline Padding + Alignment Optimization](#2-atomic-index-cacheline-padding--alignment-optimization)
+        * [3. Software Prefetch](#3-software-prefetch)
+* [MPSC Lock-Free Queue](#mpsc-lock-free-queue) - TODO
+
+
 ## SPSC Lock-Free Queue
+
+### SPSC API
 This is a single-producer, single-consumer lock-free queue implementation. It currently only works for trivially copyable types (proof of concept), but I am currently working on making it valid for all types. The API is quite simple and is intended to be used by two separate threads (consumer and producer).  
   
 It is defined as follows:  
@@ -18,11 +31,12 @@ foundry_runtime::spsc_queue<class T, size_t capacity = 128, bool enable_cachelin
   
 
 ### SPSC Queue Performance Experiments
+#### SPSC Experiment Context
 Although I definitely have some utility for this, I used this as an exercise to explore how these various optimizations vary in performance with various ring buffer capacities. I also compared performance to generic mutex wrapped `std::queue`. I ran 10 million enqueue and dequeue operations 10 times per queue size and optimization permutation and averaged the result into one entry in the plot below. These were all run on my Apple M3 Max with `QoS=USER_INTERACTIVE` to bias towards p-cores, although MacOS provides no user APIs I am aware of that allows me explicitly schedule a thread to be run on a p-core. It is additionally worth noting that I compiled with the -O3 clang compiler flag and that the producer/consumer threads yield on a failure to enqueue or dequeue although experiments with busy waiting did not meaningfully change performance.  
   
 ![SPSC Optimization Data](examples/spsc_queue/figures/spsc_data.png)
 The results are quite interesting and illustrate some interesting microarchitectural performance regimes. I will lay out some of my observations and interpretations below. 
-1. **Mutex Queue vs Non-Optimized Atomic Implementation**    
+#### 1. Mutex Queue vs Non-Optimized Atomic Implementation
 a. **Lock-Free Throughput Maxima**   
     The lock-free queue of `uint64_t` without prefetch and r/w index padding outperforms a standard mutex queue between ~16-512 entries (128 B to 4 KB). In this range, the entire ring buffer fits easily within each core's 128 KB L1d and is thus not bound by capacity and L2/L3 latency. The mutex implementation uses costly lock/unlock operations, as well as additional branching to serialize execution independent of cacheline contention. The lock-free implementation instead uses atomic r/w index updates. Despite significant traffic between cores, the lock-free queue achieves ~2x throughput in this range (really just ~32-256).  
     At small sizes (~4-16 entries), the producer and consumer repeatedly operate on the same cachelines in tight sequence. Each enqueue requires exclusive line ownership with subsequent reads from the consumer. The lines are invalidated and ownership is transferred between cores so frequently that the queue stalls, throttling throughput.  
@@ -81,8 +95,8 @@ b. **Worst Case Synchronization Mechanics Between Queue Implementations**
 
     Kernel transitions can be extremely expensive, but that alone doesn't guarantee better performance. For very small and larger buffer sizes, the unoptimized lock-free implementation performs worse than the mutex-based queue despite avoiding syscalls. This indicates that microarchitecture, not just kernel transitions, drastically affects performance. To address this, I used additional techniques to improve baseline throughput and stabilize across buffer sizes. I outline these below.  
     
-2. **Atomic Index Cacheline Padding+Alignment Optimization**    
-This is labelled as `Pad=On` on the queue configuraiton axis. Its purpose is to eliminate false sharing between the ring buffer read and write indices. To achieve this, the atomic read and write inidices are aligned to the size of a cacheline (128 B on M-Series Macs and 64 B on most x86 systems). Each index is padded to completely occupy its own cacheline to prevent unintended interation. 
+#### 2. Atomic Index Cacheline Padding + Alignment Optimization
+This is labelled as `Pad=On` on the queue configuration axis. Its purpose is to eliminate false sharing between the ring buffer read and write indices. To achieve this, the atomic read and write inidices are aligned to the size of a cacheline (128 B on M-Series Macs and 64 B on most x86 systems). Each index is padded to completely occupy its own cacheline to prevent unintended interation. 
     ```
     // explicitly set to 128 bytes on my system as this is not included in the MacOS clang installation
     static constexpr std::size_t cacheline_size = std::hardware_destructive_interference_size;
@@ -97,19 +111,56 @@ This is labelled as `Pad=On` on the queue configuraiton axis. Its purpose is to 
     PaddedLine write_next{}; 
     PaddedLine read_next{}; 
     ```
-    Without padding, `write_next` and `read_next` are declared adjacently, so in most cases, share the same cacheline. Although the producer only modifies `write_next` and the consumer only modifies `read_next`, the CPU handles coherence on a cacheline basis. If both indices occupy the same cacheline, we go through a continuous loop of:  
-    -> Produce enqueues and writes `write_next`    
-    -> Cacheline marked dirty in the producer's core   
-    -> The consumers copy of that line gets invalidated even though `read_next` was not modified      
-    -> Consumer dequeues and wants to write `read_next`
-    -> Consumer core must go out and fetch that line exclusive
-    -> Consumer writes `read_next`       
-    -> We do this for every enqueue/dequeue pair...    
+    Without padding, `write_next` and `read_next` are declared adjacently, so in most cases, share the same cacheline. Although the producer only modifies `write_next` and the consumer only modifies `read_next`, the CPU handles coherence on a cacheline basis. If both indices occupy the same cacheline, we go through a continuous loop of: 
+    ``` 
+    -> Produce enqueues and writes `write_next`.    
+    -> Cacheline marked dirty in the producer's core.   
+    -> The consumers copy of that line gets invalidated even though `read_next` was not modified.      
+    -> Consumer dequeues and wants to write `read_next`.
+    -> Consumer core must go out and fetch that line exclusive.
+    -> Consumer writes `read_next`.       
+    -> We do this for every enqueue/dequeue pair...   
+    ``` 
     Although the variables are independent, the entire cacheline must get moved between cores. This results in a large amount of unintended line ownership transfers. Padding forces `write_next` and `read_next` onto their own cachelines allowing each core to hold exclusive write ownership of that line. The additonal memory footprint is negligible compared to the costly ownership transfer in the alternative.
-    The effects of this optimization are shown in the plot above. The `Pad=On Prefetch=Off` curve has a similar shape to `Pad=Off Prefetch=Off`, but its local maximum between ~256-512 entries has ~3x higher throughput. At very small buffer sizes, performance is similar to the unoptimized version because the primary performance cost is ownership transfer of actual entries in the ring buffer as opposed to the read/write indices. At larger buffer sizes, reuse distance increases and L2/L3 latency again becomes the limiter. False sharing of the indices does not prevent throughput collapse, and performance converges with the unoptimized verison. Cacheline padding alone significantly improves throughput in a very specific window, but it does not address L2/L3 latency associated with larger memory footprint. These experiments were only run with `uint64_t` which is relatively small. I sought a way to stablize across larger memory footprints, both in terms of buffer size and type size.  
+    The effects of this optimization are shown in the plot above. The `Pad=On Prefetch=Off` curve has a similar shape to `Pad=Off Prefetch=Off`, but its local maximum between ~256-512 entries has ~3x higher throughput. At very small buffer sizes, performance is similar to the unoptimized version because the primary performance cost is ownership transfer of actual entries in the ring buffer as opposed to the read/write indices. At larger buffer sizes, reuse distance increases and L2/L3 latency again becomes the limiter. False sharing of the indices does not prevent throughput collapse, and performance converges with the unoptimized version. Cacheline padding alone significantly improves throughput in a very specific window, but it does not address L2/L3 latency associated with larger memory footprint. These experiments were only run with `uint64_t` which is relatively small. I sought a way to stablize across larger memory footprints, both in terms of buffer size and type size.  
+#### 3. Software Prefetch
+This is labelled as `Prefetch=+N` on the queue configuration axis. It's purpose is to reduce cache miss latency associated with larger memory footprints. To acheive this, I embedded two prefetch calls within `try_enqueue` and `try_dequeue` which prefetch N queue entries ahead. The effective memory distance depends on both `prefetch_distance` and `sizeof(T)`.  
+    ```
+    // Prefetch index is calculated using prefetch_distance and sizeof(T)
+    sw_prefetch_write(&queue[prefetch_index]);
+    // lowers to
+    prfm   pstl1keep, [x?] // prefetch for store into the L1d and keep
 
-
-**Prefetch Optimization Analysis IN PROGRESS**
-
-  
+    sw_prefetch_read(&queue[prefetch_index]);
+    // lowers to 
+    prfm   pldl1keep, [x?] // prefetch for load into the L1d and keep
+    ```
+    One AArch64, clang lowers to `prfm` hint instructions which are non-binding hints that suggests the processor fetch the line before access. Worst case latency becomes more likely as reuse distance increases and the ring buffer footprint takes up larger amounts of the local cache:  
+    ```
+    -> The Producer writes queue entry X.  
+    -> That line is eventually evicted from it's cores specific caches (L1d/L2).  
+    -> The Consumer later tries to read queue entry X.  
+    -> If the line is not in any nearby cache, the miss must propogate to further up in the cache hierarchy.  
+    -> The Consumer reads and processes the entry.  
+    -> The Producer later attempts to write to the next slot which also may not be in its L1d repeating the above cycle.  
+    ```
+    As memory footprint increases, these cache miss events increase in frequency, increasing average latency and throttling throughput. Wuthout prefetch, these misses happen the moment data is needed, potentially incurring a cost of 100s of cycles per access depending which layer of the cache hierarchy we miss in.  
+    To mitigate this, we can use read and write prefetch (although I will show below that write prefetch does the heavy lifting for this type of workload). At small buffer sizes (this is independent of `sizeof(T)`), throughput is still dominated by ownership transfer frequency. Prefetch does not solve this problem. However at larger buffer sizes, prefetch stablizes throughput of the local maximum acheived with `Pad=On Prefetch=Off`, allowing the queue to maintain performance across larger memory footprints. Prefetch distance did not significantly affect throughput for `uint64_t`, although I would expect excessive prefetch distances to not improve performace as significantly as reuse distance increases. I will explore the interaction between `prefetch_distance`, `sizeof(T)`, and `capacity` further below.  
+    **Note:** it is worth noting that we prefetch on every single queue access, so for smaller `sizeof(T)` this would result in extra `prfm` instructions issued to the CPU, but I did not see any performance differences when modulating this, so I infer that the CPU ignores these extra prefetches, or that they don't incur a penalty as lines will already be in the L1d.   
+#### 4. Write vs Read Prefetch
+**Analysis IN PROGRESS**   
 ![Prefetch Experiment](examples/spsc_queue/figures/prefetch_experiment.png)
+#### 5. Modulating `sizeof(T)`
+**Analysis IN PROGRESS**     
+    a. Prefetching too far ahead (prefetch operates in an optimal range) => possibly contrast based on data type size.    
+    b. Contrast data type sizes. How do we do at different sizeof(T).    
+#### 6. Combining Prefetch and Padding
+**Analysis IN PROGRESS**   
+#### 7. Conclusions
+**Analysis IN PROGRESS**   
+---
+[Table of Contents](#table-of-contents)
+  
+## MPSC Lock-Free Queue
+---
+[Table of Contents](#table-of-contents)
