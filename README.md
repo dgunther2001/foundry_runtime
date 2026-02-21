@@ -4,6 +4,8 @@ Foundry Runtime is a collection of runtime tools and performance experiments foc
 ## Table of Contents
 * [SPSC Lock-Free Queue](#spsc-lock-free-queue)
     * [API](#spsc-api)
+        * [1. SPSC Template Parameters](#1-spsc-template-parameters)
+        * [2. SPSC Functions](#2-spsc-functions)
     * [Performance Experiments](#spsc-queue-performance-experiments)
         * [0. Context](#spsc-experiment-context)
         * [1. Mutex Queue vs Non-Optimized Atomic Implementation](#1-mutex-queue-vs-non-optimized-atomic-implementation)
@@ -15,9 +17,10 @@ Foundry Runtime is a collection of runtime tools and performance experiments foc
 ## SPSC Lock-Free Queue
 
 ### SPSC API
-This is a single-producer, single-consumer lock-free queue implementation. It currently only works for trivially copyable types (proof of concept), but I am currently working on making it valid for all types. The API is quite simple and is intended to be used by two separate threads (consumer and producer).  
+This is a single-producer, single-consumer lock-free queue implementation. It is implemented using an array of type `T` as a ring-buffer. It currently only works for trivially copyable types (proof of concept), but I am currently working on making it valid for all types. The API is quite simple and is intended to be used by two separate threads (consumer and producer). Only the producer may call `try_enqueue` and the consumer may call `try_dequeue`. We rely on this to avoid additional constrainsts associated with MPSC and MPMC queues. Violating this results in undefined behavior. Although the queue can be used entirely by a single thread, doing so would be pointless and likely be less peformant than an `std::queue`.   
   
 It is defined as follows:  
+#### 1. SPSC Template Parameters
 ```
 foundry_runtime::spsc_queue<class T, size_t capacity = 128, bool enable_cacheline_padding = false, size_t prefetch_distance = 0>
 ```
@@ -28,7 +31,12 @@ foundry_runtime::spsc_queue<class T, size_t capacity = 128, bool enable_cachelin
 `enable_cacheline_padding` is a performance optimization that stores the atomic read and write (enqueue + dequeue) indices into a struct that is aligned to the size of a cacheline (128 bytes for Apple M-Series computers). This struct is then padded with a char buffer that is never referenced to the length of the cacheline not occupied by the atomic index. As a result, we don't get cache invalidate ping-pong between the two cores running the producer and consumer threads (especially when the read and write indices would share the same cacheline otherwise). 
    
 `prefetch_distance` is another performance optimization that uses software read and write prefetch instructions to hint the CPU to pull entries in the ring buffer into the L1 cache of the core running the thread that will soon need them before a read or write occurs. This reduces CPU stalls while the core goes and fetches the line (can be 100s of wasted cycles if not more). The distance ahead in the queue (array) that will be prefetched can be modulated by this template parameter. 0 disables prefetch. Any number beyond this specifies how many entries ahead we prefetch. For example, if we have a uint64_t and specify a `prefetch_distance` of 4, then we will be prefetching 32 bytes ahead (on M3 a quarter-line).  
-  
+
+#### 2. SPSC Functions
+`bool try_enqueue(const T& in_data)` is intended to be called from the producer thread and will attempt to enqueue data of type `T` into the queue. It will return `true` if successful and `false` if unsuccessful (ring-buffer is full). The user is responsible for determining whether dropped data is acceptable because if `try_enqueue` returns `false`, `in_data` will not be enqueued.    
+
+`bool try_dequeue(T& out_data)` is intended to be called from the consumer thread and will attempt to dequeue data of type `T` from the queue and store it at the memory location `out_data` points to. It will return `true` if successful and `false` if unsuccessful (ring-buffer empty). The user is responsible for dequeue failure retry logic (thread yielding/sleep/etc).   
+
 
 ### SPSC Queue Performance Experiments
 #### SPSC Experiment Context
